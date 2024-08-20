@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 This script checks and ensures that specific registry keys for Citrix ICA Client are correctly set and simulates activity to keep Citrix sessions alive.
 
@@ -43,7 +43,7 @@ The log file is saved in the user's temporary folder.
 param (
     [switch]$SetRegistryKeys,
     [int]$Interval = 15000,  # Interval for the keep-alive function in milliseconds
-    [int]$Keystroke = 126  # Default keystroke is F15 key
+    [int]$Keystroke = 126     # Default keystroke is F15 key
 )
 
 # Function to ensure the script is running with admin rights
@@ -88,7 +88,7 @@ function Set-RegistryKeyIfDifferent {
             Write-Output "Registry value $name in $path is already correctly set."
         }
     } catch {
-        Write-Error "An error occurred while setting the registry value $name in $path : $_"
+        Write-Error "An error occurred while setting the registry value $name in $path. Error: $_"
     }
 }
 
@@ -195,9 +195,17 @@ if (Test-Path $icaClientPath) {
             for ($index = 0; $index -lt $NumSessions; $index++) {
                 $sessionid = $ICO.GetEnumNameByIndex($EnumHandle, $index)
                 Write-Output "Simulating keepalive for session: $sessionid"
-                $ICO.StartMonitoringCCMSession($sessionid, $true)
-                $ICO.Session.Keyboard.SendKeyDown($Keystroke)  # Simulate the specified key press
-                $ICO.StopMonitoringCCMSession($sessionid)
+                
+                try {
+                    # Attempt to send the keystroke
+                    $ICO.StartMonitoringCCMSession($sessionid, $true)
+                    $ICO.Session.Keyboard.SendKeyDown($Keystroke)  # Simulate the specified key press
+                    Start-Sleep -Milliseconds 100  # Small delay to ensure the action is registered
+                    $ICO.StopMonitoringCCMSession($sessionid)
+                } catch {
+                    Write-Output "Failed to simulate keystroke for session $sessionid. Error: $_"
+
+                }
             }
 
             $ICO.CloseEnumHandle($EnumHandle) | Out-Null
