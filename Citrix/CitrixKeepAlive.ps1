@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 Keeps Citrix Workspace sessions alive by simulating user activity and ensures necessary registry keys are set.
 
@@ -30,6 +30,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Path\To\CitrixKeepAl
   - **System Tray Icon:** The script runs with a system tray icon for interaction. Use the icon to pause, resume, or exit the script.
   - **Single Instance Enforcement:** The script ensures only one instance runs at a time.
 
+Version history:
+  v2.0 - Fixes: pause/resume via named EventWaitHandle, MessageBox vanuit main thread,
+         beide ProgramFiles paden, LogLevel filtering, Ensure-Admin pad, log rotatie.
+
 #>
 
 param (
@@ -39,6 +43,19 @@ param (
 # Add necessary assemblies
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX #1: Pause/Resume via named EventWaitHandle (cross-process/job shared state)
+# $global:keepAlivePaused werkte niet over de job-boundary heen omdat main thread
+# en background job elk hun eigen geheugenruimte hebben. Een named EventWaitHandle
+# is een kernel-object dat door beide processen gedeeld wordt via de naam.
+# ─────────────────────────────────────────────────────────────────────────────
+$pauseEventName = "CitrixKeepAlive_Pause"
+$pauseEvent = [System.Threading.EventWaitHandle]::new(
+    $false,                                          # initieel: niet gesignaleerd (= actief)
+    [System.Threading.EventResetMode]::ManualReset,  # moet handmatig gereset worden
+    $pauseEventName
+)
 
 # Function to load settings from configuration file
 function Load-Config {
@@ -59,7 +76,10 @@ function Load-Config {
     }
 }
 
-# Function for logging with different levels
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX #4: LogLevel filtering — $LogLevel werd gelezen maar nooit gebruikt.
+# Toegevoegd: levelOrder lookup zodat "Warning" ook "Error" doorlaat, etc.
+# ─────────────────────────────────────────────────────────────────────────────
 function Write-Log {
     param (
         [string]$message,
@@ -68,30 +88,60 @@ function Write-Log {
     )
     $allowedLevels = @("Info", "Warning", "Error")
     if ($allowedLevels -contains $level) {
-        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        $logEntry = "[$timestamp] [$level] $message"
-        Add-Content -Path $logPath -Value $logEntry
-        if ($WriteToConsole) {
-            try {
-                if ($level -eq "Error") {
-                    Write-Error $message
-                } elseif ($level -eq "Warning") {
-                    Write-Warning $message
-                } else {
-                    Write-Output $message
+
+        # Controleer of het log-niveau hoog genoeg is om te loggen
+        $levelOrder = @{ "Info" = 0; "Warning" = 1; "Error" = 2 }
+        $configuredLevel = if ($script:LogLevel -and $levelOrder.ContainsKey($script:LogLevel)) {
+            $script:LogLevel
+        } else {
+            "Info"  # fallback als LogLevel niet geconfigureerd is
+        }
+
+        if ($levelOrder[$level] -ge $levelOrder[$configuredLevel]) {
+            # ─────────────────────────────────────────────────────────────────
+            # FIX #6: Log rotatie — voorkom dat het logbestand oneindig groeit.
+            # Als het log groter is dan 5 MB, hernoem naar .log.bak en begin opnieuw.
+            # ─────────────────────────────────────────────────────────────────
+            if (Test-Path $logPath) {
+                $logSize = (Get-Item $logPath).Length
+                if ($logSize -gt 5MB) {
+                    $bakPath = "$logPath.bak"
+                    # Overschrijf eventueel bestaand .bak bestand
+                    Move-Item -Path $logPath -Destination $bakPath -Force
                 }
-            } catch [System.Management.Automation.PipelineStoppedException] {
-                # Suppress the exception when the pipeline is stopped
+            }
+
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $logEntry = "[$timestamp] [$level] $message"
+            Add-Content -Path $logPath -Value $logEntry
+
+            if ($WriteToConsole) {
+                try {
+                    if ($level -eq "Error") {
+                        Write-Error $message
+                    } elseif ($level -eq "Warning") {
+                        Write-Warning $message
+                    } else {
+                        Write-Output $message
+                    }
+                } catch [System.Management.Automation.PipelineStoppedException] {
+                    # Suppress the exception when the pipeline is stopped
+                }
             }
         }
     }
 }
 
-# Function to ensure the script is running with admin rights
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX #5: Ensure-Admin gebruikte hardcoded SysWOW64 pad.
+# Op 64-bit systemen met een 64-bit PowerShell-sessie bestaat SysWOW64\powershell.exe
+# wel, maar het is de 32-bit versie — onnodig en potentieel problematisch.
+# Gebruik nu $PSHOME zodat altijd dezelfde PowerShell-versie herstart wordt.
+# ─────────────────────────────────────────────────────────────────────────────
 function Ensure-Admin {
     if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-        # Restart the script with elevated privileges
-        $cmd = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+        # Herstart het script met verhoogde rechten, gebruik dezelfde PowerShell-executable
+        $cmd = Join-Path $PSHOME "powershell.exe"
         Start-Process $cmd -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -SetRegistryKeys" -Verb RunAs -Wait
         exit
     }
@@ -184,10 +234,13 @@ $configPath = Join-Path -Path (Split-Path -Parent $PSCommandPath) -ChildPath "co
 $config = Load-Config -configPath $configPath
 
 # Retrieve settings from configuration
-$Interval = $config.Interval
-$Keystroke = $config.Keystroke
-$LogLevel = $config.LogLevel
-$IconPath = $config.IconPath
+$Interval   = $config.Interval
+$Keystroke  = $config.Keystroke
+$LogLevel   = $config.LogLevel   # nu daadwerkelijk gebruikt in Write-Log (FIX #4)
+$IconPath   = $config.IconPath
+
+# Maak LogLevel beschikbaar als script-scope variabele voor Write-Log
+$script:LogLevel = $LogLevel
 
 # Start logging
 $logPath = Join-Path $env:TEMP "CitrixKeepAlive.log"
@@ -198,16 +251,16 @@ if ($SetRegistryKeys) {
 
     # Define necessary registry keys and values
     $keys = @{
-        "AllowSimulationAPI" = 1
+        "AllowSimulationAPI"  = 1
         "AllowLiveMonitoring" = 1
     }
 
     # Ensure registry keys are set correctly
     Ensure-RegistryKeys -basePath "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client" `
-                        -ccmPath "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM" `
+                        -ccmPath  "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM" `
                         -keys $keys
     Ensure-RegistryKeys -basePath "HKLM:\Software\Citrix\ICA Client" `
-                        -ccmPath "HKLM:\Software\Citrix\ICA Client\CCM" `
+                        -ccmPath  "HKLM:\Software\Citrix\ICA Client\CCM" `
                         -keys $keys
 
     Write-Log "Registry keys have been set." "Info"
@@ -215,14 +268,25 @@ if ($SetRegistryKeys) {
     exit
 }
 
-# Check if Citrix ICA Client is installed
-$icaClientPath = Join-Path $env:ProgramFiles "Citrix\ICA Client\wfica32.exe"
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX #3: Hardcoded ProgramFiles pad voor wfica32.exe.
+# Op 64-bit Windows staat de Citrix client vaak in Program Files (x86), niet in
+# Program Files. Check nu beide locaties en gebruik de eerste die bestaat.
+# ─────────────────────────────────────────────────────────────────────────────
+$citrixPaths = @(
+    (Join-Path $env:ProgramFiles "Citrix\ICA Client\wfica32.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Citrix\ICA Client\wfica32.exe")
+)
+$icaClientPath = $citrixPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-if (Test-Path $icaClientPath) {
-    Write-Log "Citrix ICA Client found." "Info"
+if ($icaClientPath) {
+    Write-Log "Citrix ICA Client found at: $icaClientPath" "Info"
+
+    # Bepaal ook het juiste pad voor WfIcaLib.dll (zelfde map als wfica32.exe)
+    $icaClientDir = Split-Path -Parent $icaClientPath
 
     $keys = @{
-        "AllowSimulationAPI" = 1
+        "AllowSimulationAPI"  = 1
         "AllowLiveMonitoring" = 1
     }
 
@@ -237,12 +301,11 @@ if (Test-Path $icaClientPath) {
         Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -SetRegistryKeys" -Verb RunAs -Wait
 
         # Wait for registry keys to be set
-        $maxWaitTime = 60  # seconds
-        $waitInterval = 5  # seconds
-        $elapsedTime = 0
+        $maxWaitTime  = 60  # seconds
+        $waitInterval = 5   # seconds
+        $elapsedTime  = 0
 
         while ($elapsedTime -lt $maxWaitTime) {
-            # Re-check the registry settings
             $settingsCorrect = Are-RegistryKeysSet -keys $keys
 
             if ($settingsCorrect) {
@@ -256,7 +319,17 @@ if (Test-Path $icaClientPath) {
 
         if (-not $settingsCorrect) {
             Write-Log "Registry keys were not set correctly after waiting. Exiting script." "Error"
-            [System.Windows.Forms.MessageBox]::Show("Registry keys could not be set. Please run the script as administrator to set registry keys.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            # ─────────────────────────────────────────────────────────────────
+            # FIX #2: MessageBox vanuit main thread (niet vanuit background job).
+            # De main thread heeft WinForms geladen en een STA-context, dus hier
+            # is MessageBox::Show() veilig. In de job zou dit falen.
+            # ─────────────────────────────────────────────────────────────────
+            [System.Windows.Forms.MessageBox]::Show(
+                "Registry keys could not be set. Please run the script as administrator to set registry keys.",
+                "Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
             Write-Log "Script ended." "Info"
             exit
         }
@@ -264,7 +337,7 @@ if (Test-Path $icaClientPath) {
 
     # Start Mutex to prevent duplicate execution
     $mutexName = "CaffeineForWorkspaceMutex"
-    $mutex = New-Object -TypeName System.Threading.Mutex($false, $mutexName)
+    $mutex     = New-Object -TypeName System.Threading.Mutex($false, $mutexName)
     $hasHandle = $false
 
     try {
@@ -276,7 +349,12 @@ if (Test-Path $icaClientPath) {
 
         if (-not $hasHandle) {
             Write-Log "The application is already running." "Warning"
-            [System.Windows.Forms.MessageBox]::Show("The application is already running.", "Caffeine for Citrix Workspace", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Exclamation)
+            [System.Windows.Forms.MessageBox]::Show(
+                "The application is already running.",
+                "Caffeine for Citrix Workspace",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Exclamation
+            )
             Write-Log "Script ended." "Info"
             exit
         }
@@ -284,22 +362,27 @@ if (Test-Path $icaClientPath) {
         # Implement system tray icon
         if (-not (Test-Path $IconPath)) {
             Write-Log "Icon file not found at $IconPath. Please check the configuration." "Error"
-            [System.Windows.Forms.MessageBox]::Show("Icon file not found. Please check the configuration.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            [System.Windows.Forms.MessageBox]::Show(
+                "Icon file not found. Please check the configuration.",
+                "Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
             Write-Log "Script ended." "Info"
             exit
         }
 
-        $trayIcon = New-Object System.Windows.Forms.NotifyIcon
-        $trayIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($IconPath)
+        $trayIcon         = New-Object System.Windows.Forms.NotifyIcon
+        $trayIcon.Icon    = [System.Drawing.Icon]::ExtractAssociatedIcon($IconPath)
         $trayIcon.Visible = $true
-        $trayIcon.Text = "Caffeine for Citrix Workspace"
+        $trayIcon.Text    = "Caffeine for Citrix Workspace"
 
         # Add context menu to the system tray icon
-        $contextMenu = New-Object System.Windows.Forms.ContextMenu
-        $exitMenuItem = New-Object System.Windows.Forms.MenuItem "Exit"
-        $pauseMenuItem = New-Object System.Windows.Forms.MenuItem "Pause"
-        $resumeMenuItem = New-Object System.Windows.Forms.MenuItem "Resume"
-        $openLogMenuItem = New-Object System.Windows.Forms.MenuItem "Open Log File"
+        $contextMenu      = New-Object System.Windows.Forms.ContextMenu
+        $exitMenuItem     = New-Object System.Windows.Forms.MenuItem "Exit"
+        $pauseMenuItem    = New-Object System.Windows.Forms.MenuItem "Pause"
+        $resumeMenuItem   = New-Object System.Windows.Forms.MenuItem "Resume"
+        $openLogMenuItem  = New-Object System.Windows.Forms.MenuItem "Open Log File"
         $resumeMenuItem.Enabled = $false
         $contextMenu.MenuItems.Add($pauseMenuItem)
         $contextMenu.MenuItems.Add($resumeMenuItem)
@@ -313,31 +396,36 @@ if (Test-Path $icaClientPath) {
                 $global:scriptRunning = $false
                 $trayIcon.Visible = $false
                 $trayIcon.Dispose()
-                # Close the form to exit the message loop
                 $form.Close()
             } catch {
                 # Suppress any exceptions
             }
         })
 
-        # Handle Pause menu item click
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX #1 (vervolg): Pause/Resume via named EventWaitHandle.
+        # In plaats van $global:keepAlivePaused (werkt niet over job-boundary)
+        # gebruiken we Set()/Reset() op het gedeelde kernel-object.
+        # De background job doet WaitOne(0) om te checken of het event gesignaleerd is.
+        # ─────────────────────────────────────────────────────────────────────
         $pauseMenuItem.Add_Click({
             try {
-                $global:keepAlivePaused = $true
-                $pauseMenuItem.Enabled = $false
-                $resumeMenuItem.Enabled = $true
+                # Signaleer het event -> job weet dat hij moet pauzeren
+                $pauseEvent.Set()
+                $pauseMenuItem.Enabled   = $false
+                $resumeMenuItem.Enabled  = $true
                 Write-Log "Keep-alive function paused by user." "Info" $false
             } catch {
                 # Suppress any exceptions
             }
         })
 
-        # Handle Resume menu item click
         $resumeMenuItem.Add_Click({
             try {
-                $global:keepAlivePaused = $false
-                $pauseMenuItem.Enabled = $true
-                $resumeMenuItem.Enabled = $false
+                # Reset het event -> job hervat de keep-alive loop
+                $pauseEvent.Reset()
+                $pauseMenuItem.Enabled   = $true
+                $resumeMenuItem.Enabled  = $false
                 Write-Log "Keep-alive function resumed by user." "Info" $false
             } catch {
                 # Suppress any exceptions
@@ -350,7 +438,12 @@ if (Test-Path $icaClientPath) {
                 if (Test-Path $logPath) {
                     Invoke-Item $logPath
                 } else {
-                    [System.Windows.Forms.MessageBox]::Show("Log file not found.", "Information", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Log file not found.",
+                        "Information",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Information
+                    )
                 }
             } catch {
                 # Suppress any exceptions
@@ -358,17 +451,17 @@ if (Test-Path $icaClientPath) {
         })
 
         $global:scriptRunning = $true
-        $global:keepAlivePaused = $false
 
-        # Start the keep-alive function asynchronously
+        # ─────────────────────────────────────────────────────────────────────
+        # Start the keep-alive function as a background job.
+        # Parameters worden expliciet doorgegeven; job heeft eigen scope.
+        # ─────────────────────────────────────────────────────────────────────
         $keepAliveJob = Start-Job -ScriptBlock {
-            param($Interval, $Keystroke, $logPath, $LogLevel)
+            param($Interval, $Keystroke, $logPath, $LogLevel, $pauseEventName, $icaClientDir)
 
-            # Set global variables in job scope
-            $global:scriptRunning = $true
-            $global:keepAlivePaused = $false
-
-            # Define the Write-Log function in the job
+            # ─────────────────────────────────────────────────────────────────
+            # FIX #4 (in job): Zelfde LogLevel filtering als in main thread.
+            # ─────────────────────────────────────────────────────────────────
             function Write-Log {
                 param (
                     [string]$message,
@@ -377,36 +470,64 @@ if (Test-Path $icaClientPath) {
                 )
                 $allowedLevels = @("Info", "Warning", "Error")
                 if ($allowedLevels -contains $level) {
-                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    $logEntry = "[$timestamp] [$level] $message"
-                    Add-Content -Path $logPath -Value $logEntry
-                    if ($WriteToConsole) {
-                        try {
-                            if ($level -eq "Error") {
-                                Write-Error $message
-                            } elseif ($level -eq "Warning") {
-                                Write-Warning $message
-                            } else {
-                                Write-Output $message
+                    $levelOrder = @{ "Info" = 0; "Warning" = 1; "Error" = 2 }
+                    $configuredLevel = if ($LogLevel -and $levelOrder.ContainsKey($LogLevel)) {
+                        $LogLevel
+                    } else {
+                        "Info"
+                    }
+
+                    if ($levelOrder[$level] -ge $levelOrder[$configuredLevel]) {
+                        # FIX #6 (in job): Log rotatie ook vanuit de job
+                        if (Test-Path $logPath) {
+                            $logSize = (Get-Item $logPath).Length
+                            if ($logSize -gt 5MB) {
+                                $bakPath = "$logPath.bak"
+                                Move-Item -Path $logPath -Destination $bakPath -Force
                             }
-                        } catch [System.Management.Automation.PipelineStoppedException] {
-                            # Suppress the exception when the pipeline is stopped
+                        }
+
+                        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        $logEntry  = "[$timestamp] [$level] $message"
+                        Add-Content -Path $logPath -Value $logEntry
+
+                        if ($WriteToConsole) {
+                            try {
+                                if ($level -eq "Error") {
+                                    Write-Error $message
+                                } elseif ($level -eq "Warning") {
+                                    Write-Warning $message
+                                } else {
+                                    Write-Output $message
+                                }
+                            } catch [System.Management.Automation.PipelineStoppedException] {
+                                # Suppress the exception when the pipeline is stopped
+                            }
                         }
                     }
                 }
             }
 
-            # Define the Keep-Alive function in the job
             function Keep-Alive {
                 param (
                     [int]$Interval,
                     [int]$Keystroke
                 )
-                $wfIcaLibPath = Join-Path $env:ProgramFiles "Citrix\ICA Client\WfIcaLib.dll"
+
+                # ─────────────────────────────────────────────────────────────
+                # FIX #3 (in job): WfIcaLib.dll ook zoeken in icaClientDir
+                # (doorgegeven als parameter), zodat 32-bit én 64-bit pad werkt.
+                # ─────────────────────────────────────────────────────────────
+                $wfIcaLibPath = Join-Path $icaClientDir "WfIcaLib.dll"
+
                 if (-not (Test-Path $wfIcaLibPath)) {
                     Write-Log "WfIcaLib.dll not found at $wfIcaLibPath. Please ensure the Citrix ICA Client is properly installed." "Error" $false
-                    [System.Windows.Forms.MessageBox]::Show("WfIcaLib.dll not found. Please ensure the Citrix ICA Client is properly installed.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-                    exit
+                    # ─────────────────────────────────────────────────────────
+                    # FIX #2: Geen MessageBox vanuit de job — die heeft geen UI context.
+                    # Fout wordt via Write-Log naar het logbestand geschreven.
+                    # De main thread kan dit oppikken via job output/events indien gewenst.
+                    # ─────────────────────────────────────────────────────────
+                    return
                 }
 
                 try {
@@ -416,13 +537,21 @@ if (Test-Path $icaClientPath) {
                     $ICO = New-Object WFICALib.ICAClientClass
                     $ICO.OutputMode = [WFICALib.OutputMode]::OutputModeNormal
 
+                    # ─────────────────────────────────────────────────────────
+                    # FIX #1 (in job): Verbind met de named EventWaitHandle die
+                    # de main thread aanmaakt bij Pause/Resume. WaitOne(0) geeft
+                    # direct $true terug als het event gesignaleerd is (= paused).
+                    # ─────────────────────────────────────────────────────────
+                    $jobPauseEvent = [System.Threading.EventWaitHandle]::OpenExisting($pauseEventName)
+
                     do {
-                        if ($global:keepAlivePaused) {
+                        # Check of we gepauzeerd zijn (non-blocking check)
+                        if ($jobPauseEvent.WaitOne(0)) {
                             Start-Sleep -Seconds 1
                             continue
                         }
 
-                        $EnumHandle = $ICO.EnumerateCCMSessions()
+                        $EnumHandle  = $ICO.EnumerateCCMSessions()
                         $NumSessions = $ICO.GetEnumNameCount($EnumHandle)
 
                         Write-Log "Active sessions: $NumSessions" "Info" $false
@@ -432,20 +561,15 @@ if (Test-Path $icaClientPath) {
                             Write-Log "Simulating keepalive for session: $sessionid" "Info" $false
 
                             try {
-                                # Create a new ICAClient object for the session
                                 $SessionICO = New-Object WFICALib.ICAClientClass
                                 $SessionICO.OutputMode = [WFICALib.OutputMode]::OutputModeNormal
                                 $SessionICO.StartMonitoringCCMSession($sessionid, $true)
 
-                                # Send the keystroke to the session
                                 $SessionICO.Session.Keyboard.SendKeyDown($Keystroke)
                                 Start-Sleep -Milliseconds 100
                                 $SessionICO.Session.Keyboard.SendKeyUp($Keystroke)
 
-                                # Stop monitoring the session
                                 $SessionICO.StopMonitoringCCMSession($sessionid)
-
-                                # Release the session object
                                 [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($SessionICO)
                             } catch {
                                 Write-Log "Failed to simulate keystroke for session $sessionid. Error: $_" "Warning" $false
@@ -453,9 +577,10 @@ if (Test-Path $icaClientPath) {
                         }
 
                         [void]$ICO.CloseEnumHandle($EnumHandle)
-
                         Start-Sleep -Milliseconds $Interval
-                    } while ($global:scriptRunning)
+
+                    } while ($true)  # Job loopt tot Stop-Job wordt aangeroepen
+
                 } catch {
                     Write-Log "An error occurred in the keep-alive function. Error: $_" "Error" $false
                 } finally {
@@ -465,34 +590,61 @@ if (Test-Path $icaClientPath) {
                 }
             }
 
-            # Call Keep-Alive function
             Keep-Alive -Interval $Interval -Keystroke $Keystroke
-        } -ArgumentList $Interval, $Keystroke, $logPath, $LogLevel
+
+        } -ArgumentList $Interval, $Keystroke, $logPath, $LogLevel, $pauseEventName, $icaClientDir
 
         # Create a hidden form to start the message loop
         $form = New-Object System.Windows.Forms.Form
         $form.ShowInTaskbar = $false
-        $form.WindowState = 'Minimized'
+        $form.WindowState   = 'Minimized'
         [void]$form.Show()
         [void]$form.Hide()
+
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX #2 (vervolg): Monitor job output vanuit de main thread.
+        # Errors uit de job worden hier opgepikt en als MessageBox getoond,
+        # want de main thread heeft wel een STA/UI context.
+        # ─────────────────────────────────────────────────────────────────────
+        $jobMonitorTimer          = New-Object System.Windows.Forms.Timer
+        $jobMonitorTimer.Interval = 5000  # check elke 5 seconden
+        $jobMonitorTimer.Add_Tick({
+            if ($keepAliveJob -and $keepAliveJob.State -eq 'Failed') {
+                $errorMsg = ($keepAliveJob.ChildJobs[0].JobStateInfo.Reason.Message)
+                Write-Log "Background job failed: $errorMsg" "Error" $false
+                [System.Windows.Forms.MessageBox]::Show(
+                    "The keep-alive job stopped unexpectedly:`n$errorMsg",
+                    "Citrix KeepAlive - Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                )
+                $jobMonitorTimer.Stop()
+            }
+        })
+        $jobMonitorTimer.Start()
 
         # Run the application to process Windows messages
         [System.Windows.Forms.Application]::Run($form)
 
         # Cleanup code after form is closed
+        $jobMonitorTimer.Stop()
+        $jobMonitorTimer.Dispose()
+
         if ($keepAliveJob) {
-            Stop-Job -Job $keepAliveJob
-            Remove-Job -Job $keepAliveJob
+            Stop-Job    -Job $keepAliveJob
+            Remove-Job  -Job $keepAliveJob
         }
 
-    }
-    finally {
+    } finally {
         try {
             if ($hasHandle) {
                 $mutex.ReleaseMutex()
             }
             $mutex.Dispose()
-            # Ensure the system tray icon is cleaned up upon exit
+
+            # Ruim de named EventWaitHandle op
+            $pauseEvent.Close()
+
             if ($trayIcon) {
                 $trayIcon.Visible = $false
                 $trayIcon.Dispose()
@@ -502,9 +654,15 @@ if (Test-Path $icaClientPath) {
             # Suppress any exceptions
         }
     }
+
 } else {
-    Write-Log "Citrix ICA Client is not installed. Please install it first." "Error"
-    [System.Windows.Forms.MessageBox]::Show("Citrix ICA Client is not installed. Please install it first.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    Write-Log "Citrix ICA Client is not installed or not found in standard paths. Please install it first." "Error"
+    [System.Windows.Forms.MessageBox]::Show(
+        "Citrix ICA Client is not installed. Please install it first.",
+        "Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    )
     Write-Log "Script ended." "Info"
     exit
 }
