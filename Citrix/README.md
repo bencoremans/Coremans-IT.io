@@ -98,6 +98,7 @@ To have the script run automatically when you log in:
   - **Pause**: Temporarily pause the keep-alive functionality.
   - **Resume**: Resume the keep-alive functionality if paused.
   - **Open Log File**: Open the log file for review.
+  - **Clear Log**: Empty the current log file. Logging continues, so new entries may appear immediately. The rotated `.log.bak` file is retained.
   - **Restart**: Stop the background job, release the tray resources and single-instance lock, and start a fresh instance. Reloads configuration and Citrix detection, and resumes keepalive even if previously paused. Also available after a background-job failure.
   - **Exit**: Exit the script.
 
@@ -151,7 +152,7 @@ Live Windows/Citrix validation is still required: launch from both x86 and x64 P
 
 ## Version History
 
-- **v2.3** — Add Restart to the tray menu; relaunch only after cleanup, with configuration and Citrix detection reloaded.
+- **v2.3** — Add Restart and Clear Log to the tray menu; relaunch only after cleanup, with configuration and Citrix detection reloaded.
 - **v2.2** — COM-registration-based detection, automatic Windows PowerShell architecture selection with restart guard, registry setup in the selected view, and visible fatal background-job errors.
 - **v2.1** — Include `ProgramW6432` in client detection, ignore missing/duplicate program folders, and document matching PowerShell architecture to Citrix COM registration, including 64-bit startup and troubleshooting.
 - **v2.0** — Fixes: pause/resume via named EventWaitHandle (cross-process), MessageBox from main thread only, dual `ProgramFiles` path check (x86 + x64), LogLevel filtering, `Ensure-Admin` path fix using `$PSHOME`, log rotation at 5 MB.
