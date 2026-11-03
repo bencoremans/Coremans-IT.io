@@ -16,6 +16,9 @@ This script performs the following actions:
 .PARAMETER SetRegistryKeys
 Internal switch parameter used to set registry keys with elevated privileges. Do not use this parameter manually.
 
+.PARAMETER ArchitectureRestarted
+Internal restart-loop guard. Do not use this parameter manually.
+
 .EXAMPLE
 # Run the script normally to keep Citrix sessions alive.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Path\To\CitrixKeepAlive.ps1"
@@ -31,6 +34,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Path\To\CitrixKeepAl
   - **Single Instance Enforcement:** The script ensures only one instance runs at a time.
 
 Version history:
+  v2.2 - Resolve ICA COM registration, automatically match Windows PowerShell architecture,
+         configure the matching registry view, and surface fatal background-job errors.
   v2.1 - Detect the native Program Files folder from either PowerShell architecture;
          document 64-bit Windows PowerShell startup for 64-bit Citrix COM registration.
   v2.0 - Fixes: pause/resume via named EventWaitHandle, MessageBox from main thread only,
@@ -39,25 +44,13 @@ Version history:
 #>
 
 param (
-    [switch]$SetRegistryKeys
+    [switch]$SetRegistryKeys,
+    [switch]$ArchitectureRestarted
 )
 
 # Add necessary assemblies
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX #1: Pause/Resume via named EventWaitHandle (cross-process/job shared state)
-# $global:keepAlivePaused did not work across the job boundary because the main
-# thread and the background job each have their own memory space. A named
-# EventWaitHandle is a kernel object shared between both by name.
-# ─────────────────────────────────────────────────────────────────────────────
-$pauseEventName = "CitrixKeepAlive_Pause"
-$pauseEvent = [System.Threading.EventWaitHandle]::new(
-    $false,                                          # initially: not signaled (= active)
-    [System.Threading.EventResetMode]::ManualReset,  # must be reset manually
-    $pauseEventName
-)
 
 # Function to load settings from configuration file
 function Load-Config {
@@ -175,7 +168,7 @@ function Set-RegistryKeyIfDifferent {
     try {
         $currentValue = Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
         if ($currentValue.$name -ne $value) {
-            New-ItemProperty -Path $path -Name $name -Value $value -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $path -Name $name -Value $value -PropertyType DWord -Force -ErrorAction Stop | Out-Null
             Write-Log "Registry key $name set to $value in $path" "Info"
         } else {
             Write-Log "Registry key $name in $path is already correctly set." "Info"
@@ -194,7 +187,7 @@ function Ensure-RegistryKeys {
     )
     if (Test-Path $basePath) {
         if (-not (Test-Path $ccmPath)) {
-            New-Item -Path $ccmPath -Force | Out-Null
+            New-Item -Path $ccmPath -Force -ErrorAction Stop | Out-Null
             Write-Log "Registry key $ccmPath created." "Info"
         }
         foreach ($key in $keys.Keys) {
@@ -205,30 +198,12 @@ function Ensure-RegistryKeys {
     }
 }
 
-# Function to check if registry keys are correctly set
+# The host now matches Citrix, so the native provider selects its registry view.
 function Are-RegistryKeysSet {
-    param (
-        [hashtable]$keys
-    )
-    $settingsCorrect = $true
-
-    if (Test-Path "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client") {
-        if (-not (Test-Path "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM")) {
-            return $false
-        } else {
-            $settingsCorrect = $settingsCorrect -and (Check-RegistryKeys -path "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM" -keys $keys)
-        }
-    }
-
-    if (Test-Path "HKLM:\Software\Citrix\ICA Client") {
-        if (-not (Test-Path "HKLM:\Software\Citrix\ICA Client\CCM")) {
-            return $false
-        } else {
-            $settingsCorrect = $settingsCorrect -and (Check-RegistryKeys -path "HKLM:\Software\Citrix\ICA Client\CCM" -keys $keys)
-        }
-    }
-
-    return $settingsCorrect
+    param([hashtable]$keys)
+    $path = 'HKLM:\Software\Citrix\ICA Client\CCM'
+    if (-not (Test-Path $path)) { return $false }
+    return (Check-RegistryKeys -path $path -keys $keys)
 }
 
 # Load configuration
@@ -248,6 +223,101 @@ $script:LogLevel = $LogLevel
 $logPath = Join-Path $env:TEMP "CitrixKeepAlive.log"
 Write-Log "Script started." "Info"
 
+function Get-CitrixComRegistrations {
+    $views = @([Microsoft.Win32.RegistryView]::Registry32)
+    if ([Environment]::Is64BitOperatingSystem) {
+        $views += [Microsoft.Win32.RegistryView]::Registry64
+    }
+    foreach ($view in $views) {
+        $base = $null
+        $key = $null
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::ClassesRoot, $view)
+            $key = $base.OpenSubKey('CLSID\{238F6F83-B8B4-11CF-8771-00A024541EE3}\InprocServer32')
+            if ($key) {
+                $rawPath = [string]$key.GetValue('')
+                $serverPath = [Environment]::ExpandEnvironmentVariables($rawPath).Trim().Trim('"')
+                [pscustomobject]@{
+                    View = $view.ToString()
+                    ServerPath = $serverPath
+                }
+            }
+        } finally {
+            if ($key) { $key.Dispose() }
+            if ($base) { $base.Dispose() }
+        }
+    }
+}
+
+function Select-CitrixComRegistration {
+    param([object[]]$Registrations, [string]$CurrentView)
+
+    # Retain the current architecture if both registrations are usable.
+    $ordered = @($Registrations | Where-Object { $_.View -eq $CurrentView }) +
+               @($Registrations | Where-Object { $_.View -ne $CurrentView })
+    foreach ($registration in $ordered) {
+        if ([string]::IsNullOrWhiteSpace($registration.ServerPath)) { continue }
+        if (-not [IO.Path]::IsPathRooted($registration.ServerPath)) { continue }
+        if (-not (Test-Path -LiteralPath $registration.ServerPath -PathType Leaf)) { continue }
+        $directory = Split-Path -Parent $registration.ServerPath
+        $assemblyPath = Join-Path $directory 'WFICALib.dll'
+        if (-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) { continue }
+        return [pscustomobject]@{
+            View = $registration.View
+            ServerPath = $registration.ServerPath
+            Directory = $directory
+            AssemblyPath = $assemblyPath
+        }
+    }
+    throw 'No usable Citrix ICA COM registration was found. The registered OCX and adjacent WFICALib.dll must both exist. Repair Citrix Workspace; finding wfica32.exe alone is not sufficient. See the log for registration paths.'
+}
+
+function Get-CitrixPowerShellPath {
+    param([string]$TargetView, [bool]$Is64BitOS, [bool]$Is64BitProcess, [string]$WindowsDirectory)
+    if ($TargetView -eq 'Registry64') {
+        if (-not $Is64BitOS) { throw '64-bit Citrix requires 64-bit Windows.' }
+        $folder = if ($Is64BitProcess) { 'System32' } else { 'Sysnative' }
+    } else {
+        $folder = if ($Is64BitOS) { 'SysWOW64' } else { 'System32' }
+    }
+    Join-Path $WindowsDirectory "$folder\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+# Resolve before any registry writes, mutex acquisition or background jobs.
+$currentView = if ([Environment]::Is64BitProcess) { 'Registry64' } else { 'Registry32' }
+try {
+    $registrations = @(Get-CitrixComRegistrations)
+    foreach ($registration in $registrations) {
+        Write-Log "Citrix COM registration: $($registration.View), $($registration.ServerPath)" 'Info' $false
+    }
+    $citrix = Select-CitrixComRegistration -Registrations $registrations -CurrentView $currentView
+    Write-Log "Selected Citrix COM: $($citrix.View), $($citrix.ServerPath); current host: $currentView ($PSHOME)" 'Info' $false
+
+    if ($citrix.View -ne $currentView -or $PSVersionTable.PSEdition -ne 'Desktop') {
+        if ($ArchitectureRestarted) {
+            throw 'PowerShell architecture still does not match Citrix after restart. Automatic restart stopped to prevent a loop.'
+        }
+        $hostPath = Get-CitrixPowerShellPath -TargetView $citrix.View `
+            -Is64BitOS ([Environment]::Is64BitOperatingSystem) `
+            -Is64BitProcess ([Environment]::Is64BitProcess) -WindowsDirectory $env:SystemRoot
+        if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
+            throw "Required Windows PowerShell executable not found: $hostPath"
+        }
+        $arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -ArchitectureRestarted"
+        if ($SetRegistryKeys) { $arguments += ' -SetRegistryKeys' }
+        Write-Log "Restarting with $hostPath" 'Info' $false
+        $child = Start-Process -FilePath $hostPath -ArgumentList $arguments -PassThru -Wait -ErrorAction Stop
+        exit $child.ExitCode
+    }
+} catch {
+    $message = "Citrix initialization failed: $($_.Exception.Message)"
+    Write-Log $message 'Error' $false
+    [void][System.Windows.Forms.MessageBox]::Show($message, 'Citrix KeepAlive - Error', 'OK', 'Error')
+    exit 1
+}
+
+
 if ($SetRegistryKeys) {
     Ensure-Admin
 
@@ -257,13 +327,14 @@ if ($SetRegistryKeys) {
         "AllowLiveMonitoring" = 1
     }
 
-    # Ensure registry keys are set correctly
-    Ensure-RegistryKeys -basePath "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client" `
-                        -ccmPath  "HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\CCM" `
-                        -keys $keys
+    # Only configure the view used by this Citrix COM server.
     Ensure-RegistryKeys -basePath "HKLM:\Software\Citrix\ICA Client" `
-                        -ccmPath  "HKLM:\Software\Citrix\ICA Client\CCM" `
+                        -ccmPath "HKLM:\Software\Citrix\ICA Client\CCM" `
                         -keys $keys
+    if (-not (Are-RegistryKeysSet -keys $keys)) {
+        Write-Log "Registry setup failed verification." 'Error' $false
+        exit 1
+    }
 
     Write-Log "Registry keys have been set." "Info"
     Write-Log "Script ended." "Info"
@@ -271,29 +342,21 @@ if ($SetRegistryKeys) {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX #3: Hardcoded ProgramFiles path for wfica32.exe.
-# ProgramW6432 includes the native 64-bit folder even from 32-bit PowerShell.
-# Ignore missing environment variables and duplicate folders before checking files.
+# FIX #1: Pause/Resume via named EventWaitHandle (cross-process/job shared state)
+# $global:keepAlivePaused did not work across the job boundary because the main
+# thread and the background job each have their own memory space. A named
+# EventWaitHandle is a kernel object shared between both by name.
 # ─────────────────────────────────────────────────────────────────────────────
-$programFolders = @(
-    $env:ProgramW6432
-    $env:ProgramFiles
-    ${env:ProgramFiles(x86)}
-) | Where-Object { $_ } | Select-Object -Unique
+$pauseEventName = "CitrixKeepAlive_Pause"
+$pauseEvent = [System.Threading.EventWaitHandle]::new(
+    $false,                                          # initially: not signaled (= active)
+    [System.Threading.EventResetMode]::ManualReset,  # must be reset manually
+    $pauseEventName
+)
 
-$citrixPaths = foreach ($folder in $programFolders) {
-    Join-Path $folder 'Citrix\ICA Client\wfica32.exe'
-}
-
-$icaClientPath = $citrixPaths |
-    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-    Select-Object -First 1
-
-if ($icaClientPath) {
-    Write-Log "Citrix ICA Client found at: $icaClientPath" "Info"
-
-    # Determine the correct path for WfIcaLib.dll (same directory as wfica32.exe)
-    $icaClientDir = Split-Path -Parent $icaClientPath
+if ($citrix) {
+    $icaClientDir = $citrix.Directory
+    Write-Log "Citrix ICA COM server found at: $($citrix.ServerPath)" 'Info'
 
     $keys = @{
         "AllowSimulationAPI"  = 1
@@ -308,7 +371,7 @@ if ($icaClientPath) {
         Write-Log "Registry keys are not correctly set. Starting elevated process to set registry keys." "Warning"
 
         # Start the elevated process to set registry keys
-        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -SetRegistryKeys" -Verb RunAs -Wait
+        Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -SetRegistryKeys" -Verb RunAs -Wait
 
         # Wait for registry keys to be set
         $maxWaitTime  = 60  # seconds
@@ -530,22 +593,18 @@ if ($icaClientPath) {
                 # ─────────────────────────────────────────────────────────────
                 $wfIcaLibPath = Join-Path $icaClientDir "WfIcaLib.dll"
 
-                if (-not (Test-Path $wfIcaLibPath)) {
-                    Write-Log "WfIcaLib.dll not found at $wfIcaLibPath. Please ensure the Citrix ICA Client is properly installed." "Error" $false
-                    # ─────────────────────────────────────────────────────────
-                    # FIX #2: No MessageBox from the job — it has no UI context.
-                    # The error is written to the log file via Write-Log.
-                    # The main thread picks this up via job state monitoring.
-                    # ─────────────────────────────────────────────────────────
-                    return
+                $ErrorActionPreference = 'Stop'
+                if (-not (Test-Path -LiteralPath $wfIcaLibPath -PathType Leaf)) {
+                    throw "WFICALib.dll not found at $wfIcaLibPath. Repair the Citrix installation."
                 }
 
                 try {
                     # Load Citrix ICA Client assembly
                     [System.Reflection.Assembly]::LoadFile($wfIcaLibPath) | Out-Null
 
-                    $ICO = New-Object WFICALib.ICAClientClass
+                    $ICO = New-Object WFICALib.ICAClientClass -ErrorAction Stop
                     $ICO.OutputMode = [WFICALib.OutputMode]::OutputModeNormal
+                    Write-Log "Citrix COM activation succeeded in background job (64-bit: $([Environment]::Is64BitProcess))." "Info" $false
 
                     # ─────────────────────────────────────────────────────────
                     # FIX #1 (in job): Open the named EventWaitHandle created by
@@ -571,7 +630,7 @@ if ($icaClientPath) {
                             Write-Log "Simulating keepalive for session: $sessionid" "Info" $false
 
                             try {
-                                $SessionICO = New-Object WFICALib.ICAClientClass
+                                $SessionICO = New-Object WFICALib.ICAClientClass -ErrorAction Stop
                                 $SessionICO.OutputMode = [WFICALib.OutputMode]::OutputModeNormal
                                 $SessionICO.StartMonitoringCCMSession($sessionid, $true)
 
@@ -593,7 +652,9 @@ if ($icaClientPath) {
 
                 } catch {
                     Write-Log "An error occurred in the keep-alive function. Error: $_" "Error" $false
+                    throw
                 } finally {
+                    if ($jobPauseEvent) { $jobPauseEvent.Dispose() }
                     if ($ICO) {
                         [void][System.Runtime.Interopservices.Marshal]::ReleaseComObject($ICO)
                     }
@@ -619,8 +680,13 @@ if ($icaClientPath) {
         $jobMonitorTimer          = New-Object System.Windows.Forms.Timer
         $jobMonitorTimer.Interval = 5000  # check every 5 seconds
         $jobMonitorTimer.Add_Tick({
-            if ($keepAliveJob -and $keepAliveJob.State -eq 'Failed') {
+            if ($keepAliveJob -and $keepAliveJob.State -in @('Failed', 'Completed', 'Stopped')) {
+                $jobMonitorTimer.Stop()
+                $pauseMenuItem.Enabled = $false
+                $resumeMenuItem.Enabled = $false
+                $trayIcon.Text = 'Citrix KeepAlive - stopped'
                 $errorMsg = ($keepAliveJob.ChildJobs[0].JobStateInfo.Reason.Message)
+                if (-not $errorMsg) { $errorMsg = "Background job ended unexpectedly (state: $($keepAliveJob.State)). See $logPath" }
                 Write-Log "Background job failed: $errorMsg" "Error" $false
                 [System.Windows.Forms.MessageBox]::Show(
                     "The keep-alive job stopped unexpectedly:`n$errorMsg",
@@ -665,14 +731,4 @@ if ($icaClientPath) {
         }
     }
 
-} else {
-    Write-Log "Citrix ICA Client is not installed or not found in standard paths. Please install it first." "Error"
-    [System.Windows.Forms.MessageBox]::Show(
-        "Citrix ICA Client is not installed. Please install it first.",
-        "Error",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error
-    )
-    Write-Log "Script ended." "Info"
-    exit
 }
