@@ -31,6 +31,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Path\To\CitrixKeepAl
   - **Single Instance Enforcement:** The script ensures only one instance runs at a time.
 
 Version history:
+  v2.1 - Detect the native Program Files folder from either PowerShell architecture;
+         document 64-bit Windows PowerShell startup for 64-bit Citrix COM registration.
   v2.0 - Fixes: pause/resume via named EventWaitHandle, MessageBox from main thread only,
          dual ProgramFiles path check (x86 + x64), LogLevel filtering, Ensure-Admin path fix,
          log rotation at 5 MB.
@@ -270,14 +272,22 @@ if ($SetRegistryKeys) {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX #3: Hardcoded ProgramFiles path for wfica32.exe.
-# On 64-bit Windows, the Citrix client is typically installed in Program Files (x86),
-# not Program Files. Both locations are now checked; the first one found is used.
+# ProgramW6432 includes the native 64-bit folder even from 32-bit PowerShell.
+# Ignore missing environment variables and duplicate folders before checking files.
 # ─────────────────────────────────────────────────────────────────────────────
-$citrixPaths = @(
-    (Join-Path $env:ProgramFiles "Citrix\ICA Client\wfica32.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "Citrix\ICA Client\wfica32.exe")
-)
-$icaClientPath = $citrixPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+$programFolders = @(
+    $env:ProgramW6432
+    $env:ProgramFiles
+    ${env:ProgramFiles(x86)}
+) | Where-Object { $_ } | Select-Object -Unique
+
+$citrixPaths = foreach ($folder in $programFolders) {
+    Join-Path $folder 'Citrix\ICA Client\wfica32.exe'
+}
+
+$icaClientPath = $citrixPaths |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+    Select-Object -First 1
 
 if ($icaClientPath) {
     Write-Log "Citrix ICA Client found at: $icaClientPath" "Info"
