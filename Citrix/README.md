@@ -6,7 +6,7 @@ This PowerShell script keeps Citrix Workspace sessions alive by simulating user 
 
 The script performs the following actions:
 
-1. **Citrix ICA Client Check**: Verifies if the Citrix ICA Client (Workspace) is installed. Both `Program Files` and `Program Files (x86)` are checked automatically.
+1. **Citrix ICA Client Check**: Verifies if the Citrix ICA Client (Workspace) is installed. Both `Program Files` and `Program Files (x86)` are checked automatically, including the native 64-bit folder when launched from 32-bit PowerShell.
 2. **Registry Key Verification and Setting**: Checks for specific registry keys required for session simulation and sets them if necessary.
 3. **Elevation for Registry Changes**: If registry keys are missing, starts an elevated process to set them.
 4. **Session Simulation**: Simulates keystrokes in active Citrix sessions to prevent them from timing out.
@@ -57,13 +57,17 @@ Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ### Running the Script
 
-Open Command Prompt (`cmd.exe`) and run the following command:
+For a Citrix client whose ICA COM object is registered for 64-bit only (as observed with client 26.10.0.12), use 64-bit Windows PowerShell. Open Command Prompt (`cmd.exe`) from the Windows Start menu and run:
 
 ```cmd
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Path\To\CitrixKeepAlive.ps1"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Path\To\CitrixKeepAlive.ps1"
 ```
 
 **Replace** `"C:\Path\To\CitrixKeepAlive.ps1"` with the actual path to the script.
+
+On 64-bit Windows, `System32` contains 64-bit Windows PowerShell; `SysWOW64` contains the 32-bit version. If launching from a 32-bit process, use `%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe` to reach the 64-bit executable. Older clients registered only for 32-bit require the `SysWOW64` executable instead. The PowerShell architecture must match the Citrix COM registration; finding `wfica32.exe` alone does not establish that architecture.
+
+Run KeepAlive as the same Windows user as Citrix, without manually elevating the main process. The script requests elevation for registry setup when needed.
 
 ### Running the Script at Startup (Optional)
 
@@ -75,7 +79,7 @@ To have the script run automatically when you log in:
 
    ```cmd
    @echo off
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Path\To\CitrixKeepAlive.ps1"
+   "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Path\To\CitrixKeepAlive.ps1"
    ```
 
    Replace `"C:\Path\To\CitrixKeepAlive.ps1"` with the actual path to your script.
@@ -133,8 +137,12 @@ The `config.json` file must be in the same directory as the script and include t
 - **Citrix ICA Client Not Found**: The script searches for `wfica32.exe` in both `Program Files` and `Program Files (x86)`. If it is still not found, verify that Citrix Workspace is installed correctly and that `wfica32.exe` exists in the Citrix ICA Client directory.
 - **Pause/Resume Not Working**: Pause and Resume use a named kernel EventWaitHandle (`CitrixKeepAlive_Pause`) to communicate between the main thread and the background job. Ensure no other instance of the script is running that may have claimed the same handle name.
 
+- **COM Error `80040154` / Class Not Registered**: Check the ICA class `{238F6F83-B8B4-11CF-8771-00A024541EE3}` under `HKEY_CLASSES_ROOT\CLSID` in both registry views. If it is registered only in the 64-bit view, start the script with 64-bit Windows PowerShell using the command above. A present `WFICALib.dll` does not guarantee that the COM class is registered for the running process.
+- **Active sessions: 0**: No sessions were returned by the Citrix API. Open a Citrix desktop or application. If a session was already open when the CCM registry values were changed, fully sign out of that Citrix session and start it again, then check the log. `Simulating keepalive for session` logs an attempt; check for subsequent warnings and verify that the session remains active beyond its usual idle timeout.
+
 ## Version History
 
+- **v2.1** — Include `ProgramW6432` in client detection, ignore missing/duplicate program folders, and document matching PowerShell architecture to Citrix COM registration, including 64-bit startup and troubleshooting.
 - **v2.0** — Fixes: pause/resume via named EventWaitHandle (cross-process), MessageBox from main thread only, dual `ProgramFiles` path check (x86 + x64), LogLevel filtering, `Ensure-Admin` path fix using `$PSHOME`, log rotation at 5 MB.
 - **v1.0** — Initial release.
 
