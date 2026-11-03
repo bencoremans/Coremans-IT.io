@@ -34,6 +34,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Path\To\CitrixKeepAl
   - **Single Instance Enforcement:** The script ensures only one instance runs at a time.
 
 Version history:
+  v2.3 - Add tray Restart; stop the job and release resources before relaunching.
   v2.2 - Resolve ICA COM registration, automatically match Windows PowerShell architecture,
          configure the matching registry view, and surface fatal background-job errors.
   v2.1 - Detect the native Program Files folder from either PowerShell architecture;
@@ -453,6 +454,7 @@ if ($citrix) {
         # Add context menu to the system tray icon
         $contextMenu      = New-Object System.Windows.Forms.ContextMenu
         $exitMenuItem     = New-Object System.Windows.Forms.MenuItem "Exit"
+        $restartMenuItem  = New-Object System.Windows.Forms.MenuItem "Restart"
         $pauseMenuItem    = New-Object System.Windows.Forms.MenuItem "Pause"
         $resumeMenuItem   = New-Object System.Windows.Forms.MenuItem "Resume"
         $openLogMenuItem  = New-Object System.Windows.Forms.MenuItem "Open Log File"
@@ -460,8 +462,21 @@ if ($citrix) {
         $contextMenu.MenuItems.Add($pauseMenuItem)
         $contextMenu.MenuItems.Add($resumeMenuItem)
         $contextMenu.MenuItems.Add($openLogMenuItem)
+        $contextMenu.MenuItems.Add($restartMenuItem)
         $contextMenu.MenuItems.Add($exitMenuItem)
         $trayIcon.ContextMenu = $contextMenu
+
+        # Defer relaunch until the job, pause handle and mutex have been cleaned up.
+        $script:restartRequested = $false
+        $restartCleanupComplete = $false
+        $restartMenuItem.Add_Click({
+            if ($script:restartRequested) { return }
+            $script:restartRequested = $true
+            $restartMenuItem.Enabled = $false
+            $jobMonitorTimer.Stop()
+            Write-Log "Restart requested by user." "Info" $false
+            $form.Close()
+        })
 
         # Handle Exit menu item click
         $exitMenuItem.Add_Click({
@@ -726,8 +741,26 @@ if ($citrix) {
                 $trayIcon.Dispose()
             }
             Write-Log "Script ended." "Info"
+            $restartCleanupComplete = $true
         } catch {
             # Suppress any exceptions
+        }
+    }
+
+    if ($script:restartRequested) {
+        try {
+            if (-not $restartCleanupComplete) {
+                throw 'Cleanup did not finish. Close this instance before starting KeepAlive again.'
+            }
+            # Start fresh: reload configuration and detect Citrix again. Do not carry
+            # internal elevation/restart switches or the previous paused state.
+            $restartHost = Join-Path $PSHOME 'powershell.exe'
+            $restartArguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+            Start-Process -FilePath $restartHost -ArgumentList $restartArguments -ErrorAction Stop | Out-Null
+        } catch {
+            $message = "Unable to restart Citrix KeepAlive: $($_.Exception.Message)"
+            Write-Log $message 'Error' $false
+            [void][System.Windows.Forms.MessageBox]::Show($message, 'Citrix KeepAlive - Error', 'OK', 'Error')
         }
     }
 
