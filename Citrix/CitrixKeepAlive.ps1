@@ -34,7 +34,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Path\To\CitrixKeepAl
   - **Single Instance Enforcement:** The script ensures only one instance runs at a time.
 
 Version history:
-  v2.3 - Add tray Restart; stop the job and release resources before relaunching.
+  v2.3 - Add tray Restart and Clear Log; stop the job and release resources before relaunching.
   v2.2 - Resolve ICA COM registration, automatically match Windows PowerShell architecture,
          configure the matching registry view, and surface fatal background-job errors.
   v2.1 - Detect the native Program Files folder from either PowerShell architecture;
@@ -458,10 +458,12 @@ if ($citrix) {
         $pauseMenuItem    = New-Object System.Windows.Forms.MenuItem "Pause"
         $resumeMenuItem   = New-Object System.Windows.Forms.MenuItem "Resume"
         $openLogMenuItem  = New-Object System.Windows.Forms.MenuItem "Open Log File"
+        $clearLogMenuItem = New-Object System.Windows.Forms.MenuItem "Clear Log"
         $resumeMenuItem.Enabled = $false
         $contextMenu.MenuItems.Add($pauseMenuItem)
         $contextMenu.MenuItems.Add($resumeMenuItem)
         $contextMenu.MenuItems.Add($openLogMenuItem)
+        $contextMenu.MenuItems.Add($clearLogMenuItem)
         $contextMenu.MenuItems.Add($restartMenuItem)
         $contextMenu.MenuItems.Add($exitMenuItem)
         $trayIcon.ContextMenu = $contextMenu
@@ -517,6 +519,20 @@ if ($citrix) {
                 Write-Log "Keep-alive function resumed by user." "Info" $false
             } catch {
                 # Suppress any exceptions
+            }
+        })
+
+        # Truncate the current log without deleting it or changing the pause state.
+        # New background-job entries may appear immediately after clearing.
+        $clearLogMenuItem.Add_Click({
+            try {
+                if (Test-Path -LiteralPath $logPath) {
+                    Clear-Content -LiteralPath $logPath -ErrorAction Stop
+                }
+            } catch {
+                [void][System.Windows.Forms.MessageBox]::Show(
+                    "Unable to clear the log: $($_.Exception.Message)",
+                    'Citrix KeepAlive - Error', 'OK', 'Error')
             }
         })
 
